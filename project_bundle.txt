@@ -1,0 +1,1516 @@
+==> config.py <==
+"""Settings stored in ~/.shadow/config.json (shared by the CLI script and the menu-bar app)."""
+import json
+from pathlib import Path
+
+VERSION = "026"
+CONFIG_DIR = Path.home() / ".shadow"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+LEGACY_FILES = [  # settings from before the renames
+    Path.home() / ".agnimcq" / "config.json",
+    Path.home() / ".mcqblink" / "config.json",
+]
+DEFAULTS = {
+    "hotkey": "ctrl+alt+cmd+k",       # Karna
+    "model": "qwen3.5:4b",
+    "think": False,
+    "two_step": True,       # read screen to text first, then answer with thinking (more accurate)
+    "answer_think": False,   # thinking during the answer step
+    "options": 6,  # how many answer choices (A-F) to look for; 2-6
+    "thinking_led": True,   # keep Caps Lock LED on while the model works (off = LED stays dark)
+    "popup_seconds": 2.0,   # how long the one-word-answer popup stays on screen
+    "ollama_url": "http://localhost:11434/api/chat",
+    # ---- Arjuna: same pipeline, but the request goes to OpenRouter instead of local Ollama ----
+    "hotkey_arjuna": "ctrl+alt+cmd+m",   # Arjuna
+    "openrouter_api_key": "",          # key 1 (or set the OPENROUTER_API_KEY environment variable)
+    "openrouter_api_key_2": "",        # optional: used after key 1 has made `key_switch_after` requests
+    "openrouter_api_key_3": "",        # optional: used after key 2 has made `key_switch_after` requests
+    "key_switch_after": 40,            # requests per key before moving on to the next saved key
+    "openrouter_model": "google/gemini-2.5-flash",   # any vision-capable model slug from openrouter.ai/models
+    "openrouter_url": "https://openrouter.ai/api/v1/chat/completions",
+    # ---- Arjuna + Gemma 4: press all of Ctrl+Option+Cmd+M+K together. Same Arjuna pipeline, Gemma 4 31B vision ----
+    "hotkey_arjuna_gemma": "ctrl+alt+cmd+m+k",
+    "openrouter_model_gemma": "google/gemma-4-31b-it",
+    "arjuna_two_step": False,          # False = one call (screenshot -> answer); True = read, then solve
+}
+
+
+def save_config(cfg, path=None):
+    path = Path(path) if path else CONFIG_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, indent=2) + "\n")
+    try:
+        path.chmod(0o600)  # the file can hold your OpenRouter API key
+    except OSError:
+        pass
+
+
+def _read(path):
+    data = json.loads(Path(path).read_text())
+    return {k: v for k, v in data.items() if k in DEFAULTS} if isinstance(data, dict) else {}
+
+
+def load_config(path=None):
+    using_default = path is None
+    path = Path(path) if path else CONFIG_FILE
+    cfg = dict(DEFAULTS)
+    try:
+        if path.exists():
+            cfg.update(_read(path))
+            # v026: old configs (Karna on M) clash with Arjuna's new default M. Reset the pair to K / M.
+            if cfg["hotkey"] == cfg["hotkey_arjuna"] or (
+                    cfg["hotkey"] == "ctrl+alt+cmd+m" and cfg["hotkey_arjuna"] in ("ctrl+alt+cmd+n", "ctrl+alt+cmd+m")):
+                cfg["hotkey"], cfg["hotkey_arjuna"] = DEFAULTS["hotkey"], DEFAULTS["hotkey_arjuna"]
+                save_config(cfg, path)
+        else:
+            if using_default:
+                for legacy in LEGACY_FILES:
+                    if legacy.exists():
+                        cfg.update(_read(legacy))
+                        break
+            save_config(cfg, path)
+    except Exception:
+        pass
+    cfg["think"] = bool(cfg["think"])
+    cfg["thinking_led"] = bool(cfg["thinking_led"])
+    cfg["two_step"] = bool(cfg["two_step"])
+    cfg["answer_think"] = bool(cfg["answer_think"])
+    cfg["arjuna_two_step"] = bool(cfg["arjuna_two_step"])
+    for k in ("openrouter_api_key", "openrouter_api_key_2", "openrouter_api_key_3"):
+        cfg[k] = str(cfg[k] or "").strip()
+    try:
+        cfg["key_switch_after"] = max(1, int(cfg["key_switch_after"]))
+    except (TypeError, ValueError):
+        cfg["key_switch_after"] = DEFAULTS["key_switch_after"]
+    try:
+        cfg["popup_seconds"] = max(0.3, min(10.0, float(cfg["popup_seconds"])))
+    except (TypeError, ValueError):
+        cfg["popup_seconds"] = DEFAULTS["popup_seconds"]
+    try:
+        cfg["options"] = max(2, min(6, int(cfg["options"])))
+    except (TypeError, ValueError):
+        cfg["options"] = DEFAULTS["options"]
+    return cfg
+
+==> mcq_blink.py <==
+#!/usr/bin/env python3
+"""
+mcq_blink: hotkey -> screenshot -> model -> blink Caps Lock LED.
+
+Two models, same output:
+  Karna  (hotkey ctrl+alt+cmd+k): Qwen3.5 4B running locally through Ollama.
+  Arjuna (hotkey ctrl+alt+cmd+m): a vision model on OpenRouter (needs an API key).
+  Arjuna + Gemma 4 (hold ctrl+alt+cmd and press M and K together): Arjuna with Gemma 4 31B (OpenRouter).
+
+1 blink = A, 2 = B, 3 = C, 4 = D, 5 = E, 6 = F
+Questions with no options (one-word answers): popup in the top-right corner for ~1s, LED does not blink.
+10 fast flickers = error / couldn't find an answer.
+Press the hotkey again while the model is thinking to stop it.
+"""
+import base64
+import ctypes
+import ctypes.util
+import http.client
+import io
+import json
+import os
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+
+import requests
+from PIL import Image
+from pynput import keyboard
+
+# ------------------------- config -------------------------
+from config import CONFIG_FILE, load_config, VERSION as CFG_VERSION
+import popup
+
+CFG = load_config()  # ~/.shadow/config.json
+HOTKEY = os.environ.get("MCQ_HOTKEY", CFG["hotkey"])  # e.g. "cmd+shift+9"
+DEBUG = os.environ.get("MCQ_DEBUG", "0") == "1"       # prints every key event
+MODEL = os.environ.get("MCQ_MODEL", CFG["model"])
+# MCQ_THINK=1 lets the model reason first: slower but more accurate on maths/logic
+THINK = os.environ.get("MCQ_THINK", "1" if CFG["think"] else "0") == "1"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", CFG["ollama_url"])
+MAX_WIDTH = 1600          # downscale screenshot for speed
+BLINK_ON = 0.35
+BLINK_OFF = 0.35
+PAUSE_BEFORE_BLINKS = 1.0
+THINK_LED = CFG["thinking_led"]          # solid LED while the model works (default off)
+POPUP_SECONDS = CFG["popup_seconds"]
+# Two-step mode: (1) read the screen into text, (2) answer from the text with thinking. Much more accurate.
+TWO_STEP = os.environ.get("MCQ_TWO_STEP", "1" if CFG["two_step"] else "0") == "1"
+# Arjuna (OpenRouter)
+HOTKEY_ARJUNA = os.environ.get("ARJUNA_HOTKEY", CFG["hotkey_arjuna"])
+OPENROUTER_URL = os.environ.get("OPENROUTER_URL", CFG["openrouter_url"])
+OPENROUTER_MODEL = os.environ.get("ARJUNA_MODEL", CFG["openrouter_model"])
+ARJUNA_TWO_STEP = os.environ.get("ARJUNA_TWO_STEP", "1" if CFG["arjuna_two_step"] else "0") == "1"
+HOTKEY_GEMMA = os.environ.get("GEMMA_HOTKEY", CFG["hotkey_arjuna_gemma"])
+GEMMA_MODEL = os.environ.get("GEMMA_MODEL", CFG["openrouter_model_gemma"])
+CHORD_WAIT = 0.15   # a lone M or K waits this long in case the other key of the M+K chord follows
+NAMES = {"karna": "Karna", "arjuna": "Arjuna", "gemma": "Arjuna (Gemma 4)"}
+MODELS = {"arjuna": OPENROUTER_MODEL, "gemma": GEMMA_MODEL}   # OpenRouter model per Arjuna variant
+ANSWER_THINK = os.environ.get("MCQ_ANSWER_THINK", "1" if CFG["answer_think"] else "0") == "1"
+try:
+    _N = max(2, min(6, int(os.environ.get("MCQ_OPTIONS", CFG["options"]))))
+except ValueError:
+    _N = 6
+LETTERS = "ABCDEF"[:_N]
+_LIST = f"{', '.join(LETTERS[:-1])} or {LETTERS[-1]}"
+PROMPT = (
+    "The image is a screenshot of a quiz page. Follow these rules exactly.\n"
+    "1. If more than one question is visible, answer ONLY the first (topmost) question.\n"
+    "2. Answer options belong to a question only if they appear BELOW that question's text. "
+    "Ignore any options that appear ABOVE the question text: they belong to a previous question.\n"
+    f"3. If the question has answer options, reply with ONLY the letter of the correct option ({_LIST}).\n"
+    "4. If the question has no answer options and needs a one-word (or very short) answer, "
+    "reply exactly: ANSWER: <the answer>   (at most 3 words).\n"
+    "No explanation, nothing else."
+)
+READ_PROMPT = (
+    "This is a screenshot of a quiz. Copy ONLY the first (topmost) question and the answer options "
+    "that appear BELOW it, word for word. Ignore options above the question. "
+    "Label the options A), B), C)... in the order shown.\n"
+    "Format:\nQ: <question>\nA) <option>\nB) <option>\n"
+    "If it is a statement to judge true or false, write it as the Q: line only. "
+    "If there are no options, write only the Q: line. Do not answer it."
+)
+SOLVE_PROMPT = (
+    "{q}\n\n"
+    f"If options are listed, reply with ONLY the letter of the correct option ({_LIST}). "
+    "If it is a true/false statement, reply exactly: ANSWER: True or ANSWER: False. "
+    "Otherwise reply exactly: ANSWER: <answer> (at most 3 words)."
+)
+# -----------------------------------------------------------
+
+# ---- Caps Lock LED / state via IOKit (macOS only) ----
+_iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+_libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+
+_iokit.IOServiceMatching.restype = ctypes.c_void_p
+_iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+_iokit.IOServiceGetMatchingService.restype = ctypes.c_uint
+_iokit.IOServiceGetMatchingService.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+_iokit.IOServiceOpen.restype = ctypes.c_int
+_iokit.IOServiceOpen.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+                                 ctypes.POINTER(ctypes.c_uint)]
+_iokit.IOHIDSetModifierLockState.restype = ctypes.c_int
+_iokit.IOHIDSetModifierLockState.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_bool]
+_iokit.IOHIDGetModifierLockState.restype = ctypes.c_int
+_iokit.IOHIDGetModifierLockState.argtypes = [ctypes.c_uint, ctypes.c_int,
+                                             ctypes.POINTER(ctypes.c_bool)]
+
+_cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+
+
+def have_screen_access() -> bool:
+    try:
+        _cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+        return bool(_cg.CGPreflightScreenCaptureAccess())
+    except AttributeError:
+        return True  # very old macOS: no permission needed
+
+
+def request_screen_access() -> bool:
+    try:
+        _cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+        return bool(_cg.CGRequestScreenCaptureAccess())
+    except AttributeError:
+        return True
+
+
+K_IOHID_PARAM_CONNECT_TYPE = 1
+K_IOHID_CAPS_LOCK_STATE = 1
+
+
+def _open_hid():
+    task = ctypes.c_uint.in_dll(_libc, "mach_task_self_").value
+    svc = _iokit.IOServiceGetMatchingService(0, _iokit.IOServiceMatching(b"IOHIDSystem"))
+    if not svc:
+        raise RuntimeError("IOHIDSystem service not found")
+    conn = ctypes.c_uint(0)
+    if _iokit.IOServiceOpen(svc, task, K_IOHID_PARAM_CONNECT_TYPE, ctypes.byref(conn)) != 0:
+        raise RuntimeError("IOServiceOpen failed")
+    return conn.value
+
+
+_CONN = _open_hid()
+
+
+def caps_get() -> bool:
+    st = ctypes.c_bool(False)
+    _iokit.IOHIDGetModifierLockState(_CONN, K_IOHID_CAPS_LOCK_STATE, ctypes.byref(st))
+    return st.value
+
+
+def caps_set(on: bool) -> None:
+    _iokit.IOHIDSetModifierLockState(_CONN, K_IOHID_CAPS_LOCK_STATE, on)
+
+
+def blink(n: int, on=BLINK_ON, off=BLINK_OFF) -> None:
+    caps_set(False)
+    time.sleep(off)
+    for _ in range(n):
+        caps_set(True)
+        time.sleep(on)
+        caps_set(False)
+        time.sleep(off)
+
+
+# ---- screenshot + model ----
+def take_screenshot() -> str:
+    """Returns base64 PNG of the main display (downscaled)."""
+    path = tempfile.mktemp(suffix=".png")
+    subprocess.run(["screencapture", "-x", "-t", "png", path], check=True)
+    img = Image.open(path).convert("RGB")
+    os.remove(path)
+    if img.width > MAX_WIDTH:
+        h = int(img.height * MAX_WIDTH / img.width)
+        img = img.resize((MAX_WIDTH, h), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+class Cancelled(Exception):
+    """The user pressed the hotkey again while the model was thinking."""
+
+
+_cancel = threading.Event()
+_conn_lock = threading.Lock()
+_conn = None  # live HTTP connection to Ollama (so a second hotkey press can drop it)
+
+
+def _abort_connection() -> None:
+    """Hard-close the connection to Ollama: Ollama sees the disconnect and stops generating."""
+    with _conn_lock:
+        c = _conn
+    if c is None:
+        return
+    try:
+        if c.sock is not None:
+            c.sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        c.close()
+    except Exception:
+        pass
+
+
+LAST_LP = None   # token probabilities of the last reply (None if unavailable)
+LAST_SELF_CONF = None   # Arjuna: the model's own 0-100 estimate (used when there are no probabilities)
+CONF_SUFFIX = "\nAfter your answer, add a new line: CONF: <0-100> (how sure you are, as a percentage)."
+
+
+def _split_conf(text: str) -> str:
+    """Pull a trailing 'CONF: n' line out of the reply; remember n; return the reply without it."""
+    global LAST_SELF_CONF
+    m = re.search(r"\n?\s*CONF(?:IDENCE)?\s*[:=]\s*(\d{1,3})\s*%?\s*$", text or "", re.IGNORECASE)
+    if not m:
+        return text
+    LAST_SELF_CONF = max(0, min(100, int(m.group(1))))
+    return text[:m.start()].strip()
+
+
+def _ssl_ctx():
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def _post_json(url: str, body: str, headers: dict, timeout: float):
+    """POST on a connection that a second hotkey press can hard-close. Returns (status, bytes)."""
+    global _conn
+    u = urllib.parse.urlparse(url)
+    if u.scheme == "https":
+        conn = http.client.HTTPSConnection(u.hostname, u.port, timeout=timeout, context=_ssl_ctx())
+    else:
+        conn = http.client.HTTPConnection(u.hostname, u.port, timeout=timeout)
+    headers = {"User-Agent": "Astra/" + CFG_VERSION, **headers}   # http.client sends none; some CDNs reject that
+    with _conn_lock:
+        _conn = conn
+    try:
+        if _cancel.is_set():
+            raise Cancelled()
+        try:
+            path = (u.path or "/") + (("?" + u.query) if u.query else "")
+            conn.request("POST", path, body=body, headers=headers)
+            resp = conn.getresponse()
+            data = resp.read()
+        except Exception:
+            if _cancel.is_set():          # we closed the socket ourselves
+                raise Cancelled()
+            raise
+        if _cancel.is_set():
+            raise Cancelled()
+        return resp.status, data
+    finally:
+        with _conn_lock:
+            _conn = None
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _chat(content: str, images, think: bool, num_predict: int, lp: bool = False) -> str:
+    """Karna: local Ollama."""
+    global LAST_LP
+    msg = {"role": "user", "content": content}
+    if images:
+        msg["images"] = images
+    body = json.dumps({
+        "model": MODEL,
+        "stream": False,
+        "think": think,
+        "keep_alive": "30m",
+        "options": {"temperature": 0, "num_predict": num_predict},
+        "messages": [msg],
+        **({"logprobs": True, "top_logprobs": 5} if lp else {}),
+    })
+    status, data = _post_json(OLLAMA_URL, body, {"Content-Type": "application/json"},
+                              300 if think else 120)
+    if status >= 400:
+        raise RuntimeError(f"Ollama HTTP {status}: {data[:200]!r}")
+    j = json.loads(data)
+    LAST_LP = (j.get("logprobs") or j["message"].get("logprobs")) if lp else None
+    return j["message"].get("content", "") or ""
+
+
+KEY_STATE_FILE = CONFIG_FILE.parent / "key_state.json"
+_key_lock = threading.Lock()
+
+
+def openrouter_keys() -> list:
+    """Saved API keys (1-3), in order. Read live. The env var overrides key 1."""
+    cfg = load_config()
+    keys = [cfg["openrouter_api_key"], cfg["openrouter_api_key_2"], cfg["openrouter_api_key_3"]]
+    env = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if env:
+        keys[0] = env
+    return [k for k in keys if k]
+
+
+def _load_key_state() -> dict:
+    try:
+        d = json.loads(KEY_STATE_FILE.read_text())
+        return {"idx": int(d.get("idx", 0)), "count": int(d.get("count", 0))}
+    except Exception:
+        return {"idx": 0, "count": 0}
+
+
+def key_status() -> tuple:
+    """(keys saved, key number in use starting at 1, requests made on it)."""
+    keys = openrouter_keys()
+    st = _load_key_state()
+    return len(keys), min(st["idx"], max(0, len(keys) - 1)) + 1, st["count"]
+
+
+def openrouter_key() -> str:
+    """The key to use for the next request (rotates automatically, see _count_key_use)."""
+    keys = openrouter_keys()
+    if not keys:
+        return ""
+    with _key_lock:
+        idx = min(_load_key_state()["idx"], len(keys) - 1)
+    return keys[idx]
+
+
+def _count_key_use():
+    """Count one request on the current key. After `key_switch_after` requests move to the next
+    saved key; with no next key, stay on the current one."""
+    try:
+        keys = openrouter_keys()
+        limit = load_config()["key_switch_after"]
+        with _key_lock:
+            st = _load_key_state()
+            st["idx"] = min(st["idx"], max(0, len(keys) - 1))
+            st["count"] += 1
+            if st["count"] >= limit and st["idx"] + 1 < len(keys):
+                st["idx"] += 1
+                st["count"] = 0
+            KEY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            KEY_STATE_FILE.write_text(json.dumps(st))
+    except Exception as e:
+        print("key counter failed:", e)
+
+
+def _chat_openrouter(content: str, images, max_tokens: int, lp: bool = False, model: str = None) -> str:
+    """Arjuna: OpenRouter (OpenAI-compatible chat completions)."""
+    global LAST_LP
+    key = openrouter_key()
+    if not key:
+        raise RuntimeError("OpenRouter API key missing: set openrouter_api_key in ~/.shadow/config.json "
+                           "(menu: Settings) or the OPENROUTER_API_KEY env var")
+    parts = [{"type": "text", "text": content}]
+    for b in images or []:
+        parts.append({"type": "image_url", "image_url": {"url": "data:image/png;base64," + b}})
+    def build(with_lp):
+        return json.dumps({
+            "model": model or OPENROUTER_MODEL,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": parts}],
+            **({"logprobs": True, "top_logprobs": 5} if with_lp else {}),
+        })
+    hdrs = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + key,
+        "HTTP-Referer": "https://localhost",
+        "X-Title": "Astra",
+    }
+    try:
+        status, data = _post_json(OPENROUTER_URL, build(lp), hdrs, 120)
+        if status == 400 and lp:        # some models/providers refuse logprobs: ask again without
+            status, data = _post_json(OPENROUTER_URL, build(False), hdrs, 120)
+            lp = False
+    finally:
+        _count_key_use()                # this request counts toward the current key's quota
+    if status >= 400:
+        raise RuntimeError(f"OpenRouter HTTP {status}: {data[:300]!r}")
+    j = json.loads(data)
+    if j.get("error"):
+        raise RuntimeError(f"OpenRouter error: {str(j['error'])[:300]}")
+    choice = j["choices"][0]
+    LAST_LP = ((choice.get("logprobs") or {}).get("content")) if lp else None
+    text = (choice.get("message") or {}).get("content") or ""
+    if isinstance(text, list):
+        text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
+    return text
+
+
+def ask_model(b64: str, who: str = "karna") -> str:
+    global LAST_LP, LAST_SELF_CONF
+    LAST_LP = None
+    LAST_SELF_CONF = None
+    if who in MODELS:
+        model = MODELS[who]
+        # generous max_tokens: some OpenRouter models spend tokens on hidden reasoning first
+        def chat(content, images, think, n, lp=False):
+            if content == PROMPT or (not images and "reply with ONLY the letter" in content):
+                return _split_conf(_chat_openrouter(content + CONF_SUFFIX, images, 1024, lp, model))
+            return _chat_openrouter(content, images, 1024, lp, model)
+        two_step, think, answer_think = ARJUNA_TWO_STEP, False, False
+    else:
+        chat, two_step, think, answer_think = _chat, TWO_STEP, THINK, ANSWER_THINK
+    if not two_step:
+        return chat(PROMPT, [b64], think, 4096 if think else 48, lp=not think)
+    # Step 1 (vision, no thinking): just copy the question + options as text.
+    q = chat(READ_PROMPT, [b64], False, 600).strip()
+    if DEBUG or os.environ.get("MCQ_SHOW", "0") == "1":
+        print("read:", q)
+    if not q:
+        raise RuntimeError("could not read the question")
+    # Step 2 (text only, thinking): answer from the clean text.
+    p = SOLVE_PROMPT.format(q=q)
+    if answer_think:
+        r = chat(p, None, True, 1500)      # capped so it can't think forever
+        if r.strip():
+            return r
+    return chat(p, None, False, 48, lp=True)
+
+
+def parse_letter(text: str):
+    text = text.strip()
+    m0 = re.fullmatch(r"\W*(?:answer\s*[:\-]?\s*)?\(?([A-Fa-f])\)?\W*", text, re.IGNORECASE)
+    if m0 and m0.group(1).upper() in LETTERS:
+        return m0.group(1).upper()
+    m = [c.upper() for c in re.findall(r"\b\(?([A-Za-z])\)?\b", text) if c.upper() in LETTERS]
+    if m:
+        return m[-1]
+    m = [int(d) for d in re.findall(r"\b([1-9])\b", text) if int(d) <= len(LETTERS)]
+    if m:
+        return LETTERS[m[-1] - 1]
+    return None
+
+
+def parse_reply(text: str):
+    """Returns ("word", answer) for a one-word answer, ("letter", X) for an option, or (None, None)."""
+    text = (text or "").strip()
+    m = re.search(r"ANSWER\s*[:\-]\s*(.+)", text, re.IGNORECASE)
+    if m:
+        word = re.sub(r"^[\s\"'`*]+|[\s\"'`*.!]+$", "", m.group(1).strip().splitlines()[0])
+        if word:
+            as_letter = parse_letter(word) if len(re.sub(r"[()\s.]", "", word)) == 1 else None
+            if as_letter:                       # "ANSWER: C" on a multiple-choice question
+                return "letter", as_letter
+            return "word", word
+    if re.fullmatch(r"\W*(?:answer\s*[:\-]?\s*)?\(?[A-Fa-f]\)?\W*", text):
+        letter = parse_letter(text)
+        if letter:
+            return "letter", letter
+    up = [c for c in re.findall(r"\b([A-F])\b", text) if c in LETTERS]
+    if up:
+        return "letter", up[-1]
+    if text and len(text.split()) <= 4:     # short reply, no letter = one-word answer
+        return "word", text.strip(" .\"'*")
+    letter = parse_letter(text)
+    if letter:
+        return "letter", letter
+    return None, None
+
+
+def confidence(kind, value):
+    """Model confidence in % for the answer, or None if Ollama gave no probabilities."""
+    import math
+    try:
+        ents = LAST_LP
+        if not ents:
+            return LAST_SELF_CONF
+        clean = lambda t: re.sub(r"[\s()*.:'\"`]", "", t or "")
+        if kind == "letter":
+            for e in ents:
+                if clean(e.get("token")).upper() == value:
+                    probs = {}
+                    for t in (e.get("top_logprobs") or [{"token": e["token"], "logprob": e["logprob"]}]):
+                        c = clean(t.get("token")).upper()
+                        if c in LETTERS:
+                            probs[c] = probs.get(c, 0) + math.exp(t["logprob"])
+                    tot = sum(probs.values())
+                    mine = probs.get(value, math.exp(e["logprob"]))
+                    return round(100 * mine / (tot or mine))
+            return None
+        start = 0                                   # word answer: tokens after "ANSWER:"
+        for i, e in enumerate(ents[:5]):
+            if ":" in (e.get("token") or ""):
+                start = i + 1
+                break
+        p = 1.0
+        n = 0
+        for e in ents[start:]:
+            if not clean(e.get("token")):
+                continue
+            p *= math.exp(e["logprob"])
+            n += 1
+        return round(100 * p) if n else None
+    except Exception:
+        return None
+
+
+# ---- main flow ----
+_busy = threading.Lock()
+STATUS = {"state": "idle", "last": "", "conf": None, "answer": None, "model": None,
+          "who": "karna", "error": None, "last_error": None, "conf_self": False, "runs": 0}
+
+
+def copy_to_clipboard(text: str) -> None:
+    try:
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
+    except Exception as e:
+        print("clipboard copy failed:", e)
+
+
+def record_error(msg: str) -> None:
+    """Keep the real reason for the 10 flickers: menu item, notification and ~/.shadow/error.log."""
+    msg = str(msg)
+    STATUS["error"] = msg[:200]
+    STATUS["last_error"] = msg
+    print("error:", msg)
+    try:
+        from pathlib import Path
+        log = Path.home() / ".shadow" / "error.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except Exception:
+        pass
+
+
+def run_once(who: str = "karna"):
+    if not _busy.acquire(blocking=False):
+        return
+    original = caps_get()
+    _cancel.clear()
+    STATUS.update(who=who, model=NAMES[who], answer=None, conf=None, error=None)  # fresh slate for this question
+    STATUS["state"] = "thinking"
+    try:
+        if THINK_LED:
+            caps_set(True)  # optional "thinking" indicator
+        b64 = take_screenshot()
+        if _cancel.is_set():
+            raise Cancelled()
+        raw = ask_model(b64, who)
+        if _cancel.is_set():
+            raise Cancelled()
+        kind, value = parse_reply(raw)
+        STATUS["conf"] = confidence(kind, value)
+        STATUS["conf_self"] = bool(STATUS["conf"] is not None and not LAST_LP)
+        STATUS["answer"] = value if kind else None
+        STATUS["state"] = "answering"   # past the thinking phase: hotkey no longer cancels
+        print(f"{NAMES[who]} said: {raw!r} -> {kind}: {value}")
+        if kind == "word":
+            # one-word answer: popup only, the LED must not light up at all
+            STATUS["last"] = value[:14]
+            copy_to_clipboard(value)
+            popup.show_popup(value, POPUP_SECONDS)
+        elif kind == "letter":
+            STATUS["last"] = value
+            if THINK_LED:
+                caps_set(False)
+            time.sleep(PAUSE_BEFORE_BLINKS)
+            blink(LETTERS.index(value) + 1)
+        else:
+            STATUS["last"] = "?"
+            record_error(f"{NAMES[who]} gave no usable answer. Raw reply: {raw!r}")
+            blink(10, 0.08, 0.08)
+    except Cancelled:
+        print("cancelled by hotkey")
+        STATUS["last"] = "stopped"
+        if THINK_LED:
+            caps_set(False)
+    except Exception as e:
+        STATUS["last"] = "error"
+        record_error(f"{NAMES[who]}: {type(e).__name__}: {e}")
+        blink(10, 0.08, 0.08)
+    finally:
+        try:
+            if caps_get() != original:   # only touch the LED if something changed it
+                caps_set(original)
+        except Exception:
+            pass
+        STATUS["runs"] = STATUS.get("runs", 0) + 1
+        STATUS["state"] = "idle"
+        _busy.release()
+
+
+def cancel_thinking() -> bool:
+    """Stop the running request. True if something was actually thinking."""
+    if STATUS["state"] != "thinking":
+        return False
+    _cancel.set()
+    _abort_connection()
+    return True
+
+
+def on_hotkey(who: str = "karna"):
+    if _busy.locked():
+        # already working: a second press while thinking stops it (blinks/popup are left alone)
+        if cancel_thinking():
+            print("hotkey pressed again: stopping")
+        return
+    threading.Thread(target=run_once, args=(who,), daemon=True).start()
+
+
+# ---- hotkey: matched on physical key code (Option+letter changes the character on macOS) ----
+_VK = {
+    "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
+    "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17, "o": 31, "u": 32,
+    "i": 34, "p": 35, "l": 37, "j": 38, "k": 40, "n": 45, "m": 46,
+    "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25, "0": 29,
+}
+_ALIASES = {"control": "ctrl", "option": "alt", "opt": "alt", "command": "cmd", "super": "cmd"}
+
+
+def parse_hotkey(spec: str):
+    """'ctrl+alt+cmd+k' -> ({mods}, {keycodes}). More than one letter/digit = a chord (all held together)."""
+    parts = [p.strip().lower() for p in spec.replace("<", "").replace(">", "").split("+")]
+    parts = [_ALIASES.get(p, p) for p in parts if p]
+    mods = {p for p in parts if p in ("ctrl", "alt", "cmd", "shift")}
+    keys = [p for p in parts if p not in mods]
+    if not keys or any(k not in _VK for k in keys):
+        raise SystemExit(f"Bad hotkey {spec!r}: use modifiers + letters/digits, e.g. ctrl+alt+cmd+k")
+    return mods, frozenset(_VK[k] for k in keys)
+
+
+def _mod_of(key):
+    name = getattr(key, "name", "") or ""
+    for m in ("ctrl", "alt", "cmd", "shift"):
+        if name.startswith(m):
+            return m
+    return None
+
+
+def make_listener():
+    """One keyboard listener, three hotkeys: Karna (K), Arjuna (M) and Arjuna+Gemma 4 (M and K together)."""
+    specs = [(*parse_hotkey(HOTKEY), "karna"), (*parse_hotkey(HOTKEY_ARJUNA), "arjuna"),
+             (*parse_hotkey(HOTKEY_GEMMA), "gemma")]
+    if len({(frozenset(m), k) for m, k, _ in specs}) < len(specs):
+        raise SystemExit("Two hotkeys are the same; change hotkey / hotkey_arjuna / hotkey_arjuna_gemma in the config")
+    held = set()        # modifiers currently down
+    held_keys = set()   # letter/digit keys currently down
+    g = {"keys": set(), "mods": set(), "done": False, "timer": None, "waiting": False}   # the current key gesture
+
+    def reset_if_idle():
+        if not held_keys and not g["waiting"]:     # everything let go: next press is a new gesture
+            g.update(keys=set(), mods=set(), done=False)
+
+    def fire(final):
+        if final:
+            g["waiting"] = False
+        try:
+            _fire(final)
+        finally:
+            reset_if_idle()
+
+    def _fire(final):
+        if g["done"] or not g["keys"]:
+            return
+        hits = [s for s in specs if s[1] <= g["keys"] and s[0] <= g["mods"]]
+        if not hits:
+            return
+        best = max(hits, key=lambda s: (len(s[1]), len(s[0])))     # chord beats single key
+        # a longer hotkey (the M+K chord) could still be completed by the next key: wait a moment
+        if not final and any(len(s[1]) > len(best[1]) and best[1] <= s[1] and s[0] <= g["mods"] for s in specs):
+            if g["timer"]:
+                g["timer"].cancel()
+            g["waiting"] = True
+            g["timer"] = threading.Timer(CHORD_WAIT, fire, (True,))
+            g["timer"].daemon = True
+            g["timer"].start()
+            return
+        g["done"] = True            # one action per gesture, whatever keys are still held
+        who = best[2]
+        print(f"{NAMES[who]} hotkey pressed")
+        on_hotkey(who)
+
+    def press(key):
+        m = _mod_of(key)
+        if m:
+            held.add(m)
+        vk = getattr(key, "vk", None)
+        if DEBUG:
+            print("press", key, "vk=", vk, "held=", sorted(held))
+        if m is not None or vk is None:
+            return
+        if vk in held_keys:
+            return                  # key repeat while held: not a new press
+        held_keys.add(vk)
+        g["keys"].add(vk)
+        g["mods"] |= held
+        fire(False)
+
+    def release(key):
+        m = _mod_of(key)
+        if m:
+            held.discard(m)
+            return
+        held_keys.discard(getattr(key, "vk", None))
+        reset_if_idle()
+
+    return keyboard.Listener(on_press=press, on_release=release)
+
+
+def listen():
+    with make_listener() as l:
+        l.join()
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if args[:1] == ["now"]:          # run the whole pipeline once, no hotkey
+        run_once(args[1] if args[1:2] and args[1] in NAMES else "karna")   # python mcq_blink.py now [arjuna|gemma]
+        sys.exit(0)
+    if args[:1] == ["led"]:          # LED test: python mcq_blink.py led 3
+        blink(int(args[1]) if len(args) > 1 else 2)
+        sys.exit(0)
+    print(f"Ready. Karna: {HOTKEY} ({MODEL}, Thinking: {THINK})   Arjuna: {HOTKEY_ARJUNA} ({OPENROUTER_MODEL})   Arjuna+Gemma: {HOTKEY_GEMMA} ({GEMMA_MODEL})")
+    print("Ctrl+C to quit.")
+    try:
+        listen()
+    except KeyboardInterrupt:
+        print("\nbye")
+
+==> ollama_util.py <==
+"""Small helpers for talking to a local Ollama server."""
+import json
+
+import requests
+
+
+def base_url(chat_url: str) -> str:
+    return chat_url.split("/api/")[0].rstrip("/")
+
+
+def ollama_running(base: str) -> bool:
+    try:
+        return requests.get(base + "/api/tags", timeout=2).ok
+    except requests.RequestException:
+        return False
+
+
+def has_model(base: str, model: str) -> bool:
+    try:
+        r = requests.get(base + "/api/tags", timeout=5)
+        r.raise_for_status()
+        names = {m.get("name") for m in r.json().get("models", [])}
+    except Exception:
+        return False
+    return model in names or (":" not in model and model + ":latest" in names)
+
+
+def pull_model(base: str, model: str, progress=None) -> None:
+    """Download a model. progress(status, percent_or_None) is called as it streams."""
+    with requests.post(base + "/api/pull", json={"model": model, "stream": True},
+                       stream=True, timeout=(5, 600)) as r:
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if not line:
+                continue
+            msg = json.loads(line)
+            if "error" in msg:
+                raise RuntimeError(msg["error"])
+            total, done = msg.get("total"), msg.get("completed")
+            pct = int(done * 100 / total) if total and done is not None else None
+            if progress:
+                progress(msg.get("status", ""), pct)
+            if msg.get("status") == "success":
+                return
+
+==> popup.py <==
+"""Small always-on-top popup in the top-right corner of the screen (macOS).
+
+In the menu-bar app it runs on the app's own main thread (IN_APP = True).
+From the plain script there is no GUI loop, so it runs `python popup.py "text" secs`
+as a tiny helper process instead.
+"""
+import os
+import subprocess
+import sys
+import threading
+
+IN_APP = False   # set to True by the menu-bar app
+_KEEP = []       # keeps window objects alive while shown
+
+
+def _show_window(text, seconds=1.0):
+    """Create the popup window. Must run on the main thread."""
+    from AppKit import NSColor, NSFont, NSMakeRect, NSScreen, NSTextField, NSWindow
+    from PyObjCTools import AppHelper
+
+    vf = NSScreen.mainScreen().visibleFrame()          # area below the menu bar
+    w = max(140, min(460, 11 * len(text) + 48))
+    h = 46
+    x = vf.origin.x + vf.size.width - w - 12
+    y = vf.origin.y + vf.size.height - h - 12
+
+    win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        NSMakeRect(x, y, w, h), 0, 2, False)           # borderless, buffered
+    win.setLevel_(1000)                                # above normal and full-screen windows
+    win.setOpaque_(False)
+    win.setBackgroundColor_(NSColor.clearColor())
+    win.setIgnoresMouseEvents_(True)                   # clicks pass through
+    win.setHasShadow_(True)
+    win.setReleasedWhenClosed_(False)
+    win.setCollectionBehavior_((1 << 0) | (1 << 8))    # all Spaces + over full-screen apps
+
+    view = win.contentView()
+    try:
+        view.setWantsLayer_(True)
+        view.layer().setCornerRadius_(10.0)
+        view.layer().setBackgroundColor_(NSColor.colorWithCalibratedWhite_alpha_(0.10, 0.92).CGColor())
+    except Exception:
+        pass
+
+    label = NSTextField.alloc().initWithFrame_(NSMakeRect(8, 10, w - 16, h - 20))
+    label.setStringValue_(text)
+    label.setBezeled_(False)
+    label.setDrawsBackground_(False)
+    label.setEditable_(False)
+    label.setSelectable_(False)
+    label.setTextColor_(NSColor.whiteColor())
+    label.setFont_(NSFont.boldSystemFontOfSize_(18))
+    label.setAlignment_(1)                             # centered
+    view.addSubview_(label)
+
+    win.orderFrontRegardless()
+    _KEEP.append(win)
+
+    def close():
+        win.orderOut_(None)
+        if win in _KEEP:
+            _KEEP.remove(win)
+
+    threading.Timer(seconds, lambda: AppHelper.callAfter(close)).start()
+
+
+def show_popup(text, seconds=1.0):
+    text = " ".join(str(text).split())[:60]
+    if not text:
+        return
+    if IN_APP:
+        from PyObjCTools import AppHelper
+        AppHelper.callAfter(_show_window, text, seconds)
+    else:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), text, str(seconds)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+if __name__ == "__main__":
+    from AppKit import NSApplication
+    from PyObjCTools import AppHelper
+
+    msg = sys.argv[1] if len(sys.argv) > 1 else "Shadow"
+    secs = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(1)                        # accessory: no Dock icon
+    _show_window(msg, secs)
+    threading.Timer(secs + 0.3, lambda: AppHelper.callAfter(AppHelper.stopEventLoop)).start()
+    AppHelper.runEventLoop()
+
+==> settings_window.py <==
+"""Settings window for the Astra menu-bar app (AppKit, runs on the app's main thread)."""
+import objc
+from AppKit import (NSApplication, NSBackingStoreBuffered, NSBezelStyleRounded, NSButton, NSFont,
+                    NSMakeRect, NSTextField, NSWindow)
+from Foundation import NSObject
+
+_STYLE = 1 | 2 | 8      # titled | closable | miniaturizable
+_WIN = {"window": None, "controller": None}
+
+
+class _Controller(NSObject):
+    def initWithActions_(self, actions):
+        self = objc.super(_Controller, self).init()
+        if self is None:
+            return None
+        self.actions = actions
+        return self
+
+    @objc.IBAction
+    def clicked_(self, sender):
+        fn = self.actions.get(int(sender.tag()))
+        if fn:
+            fn()
+
+
+class _Closer(NSObject):
+    def windowWillClose_(self, _n):
+        _WIN["window"] = None
+        _WIN["controller"] = None
+
+
+def _label(view, text, x, y, w, h=20, bold=False, size=13):
+    f = NSTextField.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
+    f.setStringValue_(text)
+    f.setBezeled_(False)
+    f.setDrawsBackground_(False)
+    f.setEditable_(False)
+    f.setSelectable_(False)
+    f.setFont_(NSFont.boldSystemFontOfSize_(size) if bold else NSFont.systemFontOfSize_(size))
+    view.addSubview_(f)
+    return f
+
+
+def _button(view, ctl, title, x, y, w, tag):
+    b = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, w, 28))
+    b.setTitle_(title)
+    b.setBezelStyle_(NSBezelStyleRounded)
+    b.setTag_(tag)
+    b.setTarget_(ctl)
+    b.setAction_("clicked:")
+    view.addSubview_(b)
+    return b
+
+
+def show_settings(on_check_setup, get_keys, save_keys, open_config):
+    """Open (or focus) the settings window."""
+    app = NSApplication.sharedApplication()
+    if _WIN["window"] is not None:
+        _WIN["window"].makeKeyAndOrderFront_(None)
+        app.activateIgnoringOtherApps_(True)
+        return
+
+    W, H, M = 400, 360, 20
+    win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        NSMakeRect(0, 0, W, H), _STYLE, NSBackingStoreBuffered, False)
+    win.setTitle_("Astra Settings")
+    win.setReleasedWhenClosed_(False)
+    win.center()
+    view = win.contentView()
+
+    saved = (list(get_keys()) + ["", "", ""])[:3]
+    status = _label(view, "", M, 62, W - 2 * M, 18, size=11)
+
+    def do_save():
+        vals = [f.stringValue().strip() for f in key_fields]
+        save_keys(vals)
+        n = sum(1 for v in vals if v)
+        status.setStringValue_(f"Saved {n} key(s)." if n else "No keys saved.")
+
+    actions = {1: on_check_setup, 2: do_save, 3: open_config}
+    ctl = _Controller.alloc().initWithActions_(actions)
+
+    y = H - 44
+    _label(view, "Setup", M, y, W - 2 * M, bold=True)
+    _button(view, ctl, "Check setup", M, y - 34, 140, 1)
+
+    y -= 50
+    _label(view, "OpenRouter API keys (Arjuna)", M, y, W - 2 * M, bold=True)
+    _label(view, "One key is enough. With more, Arjuna moves to the next key after 40 requests.",
+           M, y - 36, W - 2 * M, 30, size=11)
+    key_fields = []
+    for i in range(3):
+        f = NSTextField.alloc().initWithFrame_(NSMakeRect(M + 56, y - 66 - i * 30, W - 2 * M - 56, 24))
+        f.setStringValue_(saved[i])
+        f.setPlaceholderString_("sk-or-..." + ("" if i == 0 else " (optional)"))
+        view.addSubview_(f)
+        _label(view, f"Key {i + 1}", M, y - 64 - i * 30, 52)
+        key_fields.append(f)
+    _button(view, ctl, "Save keys", W - M - 100, 84, 100, 2)
+    _button(view, ctl, "Open config file", M, 20, 140, 3)
+
+    closer = _Closer.alloc().init()   # closing the window lets it be reopened
+    win.setDelegate_(closer)
+
+    _WIN.update(window=win, controller=(ctl, closer))
+    win.makeKeyAndOrderFront_(None)
+    app.activateIgnoringOtherApps_(True)
+
+==> shadow_app.py <==
+#!/usr/bin/env python3
+"""Astra menu-bar app: hotkey -> screenshot -> AI -> Caps Lock LED blinks.
+Karna = local Ollama, Arjuna = OpenRouter."""
+import subprocess
+import threading
+import webbrowser
+
+import rumps
+
+import mcq_blink as core
+import popup
+import settings_window
+from config import CONFIG_FILE, VERSION, load_config, save_config
+from ollama_util import base_url, has_model, ollama_running, pull_model
+
+PANES = {
+    "Screen Recording": "Privacy_ScreenCapture",
+    "Accessibility": "Privacy_Accessibility",
+    "Input Monitoring": "Privacy_ListenEvent",
+}
+
+
+def open_pane(name):
+    subprocess.run(["open", f"x-apple.systempreferences:com.apple.preference.security?{PANES[name]}"])
+
+
+def notify(title, message):
+    try:
+        rumps.notification("Astra", title, message)
+    except Exception:
+        pass
+
+
+class AstraApp(rumps.App):
+    def __init__(self):
+        super().__init__("Astra", title="Astra", quit_button=None)
+        self.pull = {"active": False, "pct": None, "error": None, "done": False}
+        self.ticks = 0
+        self.screen_ok = True
+        self.listener = None
+        popup.IN_APP = True  # popups run on this app's main thread
+
+        self.status_item = rumps.MenuItem("Starting...")
+        self.answer_item = rumps.MenuItem("Last answer: -")
+        self.conf_item = rumps.MenuItem("Last confidence: -")
+        self.model_item = rumps.MenuItem("Last model: -")
+        self.key_item = rumps.MenuItem("Arjuna API key: -")
+        self.error_item = rumps.MenuItem("Last error: -", callback=self.show_error)
+        perms = rumps.MenuItem("Permissions")
+        for name in PANES:
+            perms.add(rumps.MenuItem(f"Open {name} settings", callback=self.make_pane_cb(name)))
+        self.menu = [
+            self.status_item,
+            self.answer_item,
+            self.conf_item,
+            self.model_item,
+            self.error_item,
+            self.key_item,
+            None,
+            rumps.MenuItem("Run Karna now", callback=self.run_now),
+            rumps.MenuItem("Run Arjuna now", callback=self.run_arjuna_now),
+            rumps.MenuItem("Run Arjuna (Gemma 4 31B) now", callback=self.run_gemma_now),
+            rumps.MenuItem("Test LED", callback=self.test_led),
+            None,
+            perms,
+            None,
+            rumps.MenuItem(f"Version {VERSION}"),
+            rumps.MenuItem("Settings...", callback=self.open_settings),
+            rumps.MenuItem("Quit Astra", callback=self.quit_app),
+        ]
+        self.tick_timer = rumps.Timer(self.tick, 0.5)
+        self.tick_timer.start()
+        self.start_timer = rumps.Timer(self.startup, 1)
+        self.start_timer.start()
+
+    # ---- startup ----
+    def startup(self, timer):
+        timer.stop()
+        try:
+            self.listener = core.make_listener()
+            self.listener.start()
+        except SystemExit as e:
+            rumps.alert("Bad hotkey in config", str(e))
+        if not core.have_screen_access():
+            core.request_screen_access()
+        self.check_setup(silent_ok=True)
+
+    # ---- status in the menu bar ----
+    def tick(self, _):
+        self.ticks += 1
+        if self.ticks % 10 == 1:
+            self.screen_ok = core.have_screen_access()
+        p = self.pull
+        if p["active"]:
+            pct = "" if p["pct"] is None else f" {p['pct']}%"
+            self.title = "Astra dl"
+            self.status_item.title = f"Downloading {core.MODEL}...{pct}"
+        elif core.STATUS["state"] == "thinking":
+            who = core.STATUS.get("who", "karna")
+            hk = {"arjuna": core.HOTKEY_ARJUNA, "gemma": core.HOTKEY_GEMMA}.get(who, core.HOTKEY)
+            self.title = f"{core.NAMES[who]} ..."
+            self.status_item.title = f"{core.NAMES[who]} thinking... (press {hk} to stop)"
+        else:
+            self.title = "Astra"
+            if not self.screen_ok:
+                self.status_item.title = "Needs Screen Recording permission"
+            else:
+                self.status_item.title = f"Karna {core.HOTKEY} | Arjuna {core.HOTKEY_ARJUNA} | Gemma {core.HOTKEY_GEMMA}"
+        ans = core.STATUS.get("answer")
+        self.answer_item.title = f"Last answer: {ans}" if ans else "Last answer: -"
+        c = core.STATUS.get("conf")
+        self.conf_item.title = (f"Last confidence: {'~' if core.STATUS.get('conf_self') else ''}{c}%"
+                                if c is not None else "Last confidence: -")
+        m = core.STATUS.get("model")
+        self.model_item.title = f"Last model: {m}" if m else "Last model: -"
+        n, cur, used = core.key_status()
+        if n:
+            self.key_item.title = (f"Arjuna API keys: {n} saved, using #{cur} "
+                                   f"({used}/{core.load_config()['key_switch_after']})")
+        else:
+            self.key_item.title = "Arjuna API key: NOT SET"
+        le = core.STATUS.get("last_error")
+        self.error_item.title = ("Last error: " + le[:70]) if le else "Last error: -"
+        if core.STATUS.get("error"):
+            err, core.STATUS["error"] = core.STATUS["error"], None
+            notify(f"{core.STATUS.get('model') or 'Astra'} error", err)
+        if p["done"]:
+            p["done"] = False
+            notify("Model ready", f"{core.MODEL} downloaded. You can use the hotkey now.")
+        if p["error"]:
+            err, p["error"] = p["error"], None
+            notify("Model download failed", err)
+
+    # ---- setup checks ----
+    def check_setup(self, silent_ok=False):
+        base = base_url(core.OLLAMA_URL)
+        if not ollama_running(base):
+            if rumps.alert(
+                title="Ollama isn't running",
+                message="Astra runs the AI model locally through Ollama.\n\n"
+                        "Install it from ollama.com/download, open it once, then choose Check setup again.",
+                ok="Open download page", cancel="Later",
+            ):
+                webbrowser.open("https://ollama.com/download")
+            return False
+        if not has_model(base, core.MODEL):
+            if rumps.alert(
+                title="Download the AI model?",
+                message=f"{core.MODEL} isn't installed yet (about 3.4 GB). Download it now?",
+                ok="Download", cancel="Later",
+            ):
+                self.start_pull()
+            return False
+        if not silent_ok:
+            rumps.alert("All set", f"Ollama and {core.MODEL} are ready.\nPress {core.HOTKEY} on a question.")
+        return True
+
+    def on_check_setup(self, _):
+        self.check_setup()
+
+    def start_pull(self):
+        if self.pull["active"]:
+            return
+        self.pull.update(active=True, pct=None, error=None, done=False)
+        base = base_url(core.OLLAMA_URL)
+
+        def work():
+            try:
+                def cb(status, pct):
+                    if pct is not None:
+                        self.pull["pct"] = pct
+                pull_model(base, core.MODEL, cb)
+                self.pull["done"] = True
+            except Exception as e:
+                self.pull["error"] = str(e)
+            finally:
+                self.pull["active"] = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- menu actions ----
+    def show_error(self, _):
+        le = core.STATUS.get("last_error")
+        if le:
+            rumps.alert("Last error", le + "\n\n(full log: ~/.shadow/error.log)")
+
+    def run_now(self, _):
+        core.on_hotkey("karna")
+
+    def run_arjuna_now(self, _):
+        core.on_hotkey("arjuna")
+
+    def run_gemma_now(self, _):
+        core.on_hotkey("gemma")
+
+    def open_settings(self, _):
+        settings_window.show_settings(
+            on_check_setup=self.check_setup,
+            get_keys=self.get_keys, save_keys=self.save_keys, open_config=lambda: self.open_config(None))
+
+    KEY_FIELDS = ("openrouter_api_key", "openrouter_api_key_2", "openrouter_api_key_3")
+
+    def get_keys(self):
+        cfg = load_config()
+        return [cfg[k] for k in self.KEY_FIELDS]
+
+    def save_keys(self, keys):
+        cfg = load_config()
+        for field, v in zip(self.KEY_FIELDS, keys):
+            cfg[field] = v.strip()
+        save_config(cfg)
+        notify("Arjuna", f"{sum(1 for v in keys if v.strip())} API key(s) saved. Model: {core.OPENROUTER_MODEL}")
+
+    def test_led(self, _):
+        threading.Thread(target=core.blink, args=(3,), daemon=True).start()
+
+    def make_pane_cb(self, name):
+        return lambda _sender: open_pane(name)
+
+    def open_config(self, _):
+        load_config()  # make sure the file exists
+        subprocess.run(["open", "-t", str(CONFIG_FILE)])
+
+    def quit_app(self, _):
+        rumps.quit_application()
+
+
+if __name__ == "__main__":
+    AstraApp().run()
+
+==> build_app.sh <==
+#!/bin/bash
+# Builds Astra.app and Astra-mac-arm64.zip (the file you share). Run on a Mac.
+set -euo pipefail
+cd "$(dirname "$0")"
+PY="${PYTHON:-python3}"
+
+$PY -m venv build-venv
+source build-venv/bin/activate
+pip install -q --upgrade pip
+pip install -q -r requirements.txt -r requirements-app.txt
+
+rm -rf build dist Astra.spec
+pyinstaller --noconfirm --windowed --name Astra \
+  --osx-bundle-identifier com.astra.app \
+  --hidden-import mcq_blink --hidden-import config --hidden-import ollama_util --hidden-import popup \
+  --hidden-import certifi --collect-data certifi --hidden-import AppKit --hidden-import PyObjCTools.AppHelper \
+  --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin \
+  shadow_app.py
+
+PL="dist/Astra.app/Contents/Info.plist"
+setkey() {  # setkey KEY TYPE VALUE  (add, or overwrite if it already exists)
+  /usr/libexec/PlistBuddy -c "Add :$1 $2 $3" "$PL" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :$1 $3" "$PL"
+}
+setkey LSUIElement bool true                          # menu-bar only, no Dock icon
+setkey NSScreenCaptureUsageDescription string "Astra reads the question on your screen."
+setkey NSInputMonitoringUsageDescription string "Astra listens for your hotkey."
+
+codesign --force --deep --sign - dist/Astra.app    # ad-hoc signature (required on Apple Silicon)
+rm -f Astra-mac-arm64.zip
+ditto -c -k --keepParent dist/Astra.app Astra-mac-arm64.zip
+
+echo
+echo "Built: $(pwd)/dist/Astra.app"
+echo "Share: $(pwd)/Astra-mac-arm64.zip   (read SHARING.md for what friends must do)"
+
+==> run_app.sh <==
+#!/bin/bash
+# Run Shadow from source (no build needed). Needs Python 3 and Ollama.
+cd "$(dirname "$0")"
+[ -d venv ] || python3 -m venv venv
+./venv/bin/pip install -q -r requirements.txt rumps
+exec ./venv/bin/python shadow_app.py
+
+==> requirements-app.txt <==
+rumps
+pyinstaller>=6.15
+
+==> requirements.txt <==
+requests
+pillow
+pynput
+pyobjc-framework-Cocoa
+rumps
+certifi
+
+==> START_HERE.txt <==
+Shadow - source package (macOS, Apple Silicon)
+
+1. Install Ollama: https://ollama.com/download  (open it once)
+2. ollama pull qwen3.5:4b
+3. Open Terminal in this folder, then EITHER:
+     ./run_app.sh        -> run the menu-bar app straight from source
+     ./build_app.sh      -> build Shadow.app + Shadow-mac-arm64.zip to share with friends
+4. System Settings -> Privacy & Security: allow Screen Recording, Accessibility and
+   Input Monitoring for the app you launched it from (Terminal, or Shadow.app).
+
+Karna hotkey: Ctrl+Option+Cmd+K (local Ollama).  Arjuna hotkey: Ctrl+Option+Cmd+M (OpenRouter; menu -> Settings).  Arjuna + Gemma 4 31B: hold Ctrl+Option+Cmd and press M and K together (OpenRouter, image analysis).  LED blinks: 1=A 2=B 3=C 4=D 5=E 6=F, 10 fast flickers = error.
+One-word-answer questions: popup top-right for 1s, no LED.
+More details: SHARING.md and README.md
+
+==> README.md <==
+# Shadow
+
+Hotkey -> screenshot -> Qwen3.5 4B -> answer as Caps Lock LED blinks.
+
+| Blinks | Answer |
+|--------|--------|
+| 1 | A |
+| 2 | B |
+| 3 | C |
+| 4 | D |
+| 5 | E |
+| 6 | F |
+| 10 fast flickers | error / no answer |
+
+Rules the AI follows:
+- Several questions on screen -> only the **first (topmost)** is answered.
+- Options ABOVE the question text are ignored (they belong to the previous question).
+- **One-word answer** question (no options) -> a small popup appears in the **top-right corner for 1 second**, and the LED does **not** blink at all.
+
+Press the hotkey **again while the model is thinking** to stop it (no blink, no popup).
+
+The LED stays dark while the model thinks (menu bar shows status). Set `"thinking_led": true` in the config to light it while thinking.
+
+## Setup (MacBook Air M4)
+
+```bash
+# 1. Model runtime (runs on Apple GPU, ~3.4 GB for the 4B)
+brew install ollama
+brew services start ollama
+ollama pull qwen3.5:4b
+
+# 2. Python deps
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Run
+python mcq_blink.py
+```
+
+## Arjuna (OpenRouter)
+
+Same pipeline and same output (Caps Lock blinks, one-word popup), but the screenshot goes to a model on OpenRouter instead of local Ollama.
+
+- Karna hotkey: `Ctrl + Option + Cmd + K` (local Ollama). Arjuna hotkey: `Ctrl + Option + Cmd + M` (OpenRouter).
+- Menu bar -> **Settings...** -> up to 3 OpenRouter API keys (one is enough; or edit `openrouter_api_key`, `openrouter_api_key_2`, `openrouter_api_key_3` in `~/.shadow/config.json`, or set `OPENROUTER_API_KEY` for key 1). Arjuna uses key 1 first and moves to the next saved key after 40 requests (`key_switch_after`); if there is no next key it stays on the current one.
+- Model: `openrouter_model` in the config (any vision-capable slug), default `google/gemini-2.5-flash`.
+- Menu bar shows **Last answer**, **Last confidence** and **Last model** (Karna or Arjuna). Confidence uses token probabilities when the provider returns them; otherwise Arjuna asks the model for its own estimate (shown with a `~`).
+- **Arjuna + Gemma 4 31B (v025):** hold `Ctrl + Option + Cmd` and press `M` and `K` together. Same Arjuna pipeline (screenshot -> OpenRouter -> blink/popup) but with `openrouter_model_gemma` (default `google/gemma-4-31b-it`). Plain `M` still uses `openrouter_model`; plain `K` is still Karna. A lone M or K waits ~0.15 s to see whether the other key follows. Change the chord with `hotkey_arjuna_gemma`.
+- Terminal: `python mcq_blink.py now arjuna` (or `now gemma`) runs Arjuna once.
+- Note: Arjuna sends your screenshot to OpenRouter and the model provider; Karna stays on your Mac.
+
+One-word / text answers are also copied to the clipboard automatically.
+
+## Permissions (System Settings -> Privacy & Security)
+
+Grant to the app you launch Python from (Terminal / iTerm / VS Code):
+
+- **Screen & System Audio Recording** - for `screencapture`
+- **Accessibility** and **Input Monitoring** - for the global hotkey
+
+Restart the terminal after granting.
+
+## Usage
+
+Default hotkey: `Ctrl + Option + Cmd + K`. Change with `MCQ_HOTKEY` (modifiers + one letter/digit):
+
+```bash
+MCQ_HOTKEY="cmd+shift+9" python mcq_blink.py
+```
+
+Keep the full question + options visible on screen when you press it.
+
+## Menu-bar app (shareable)
+
+See `SHARING.md`. Build with `./build_app.sh` to get `Shadow-mac-arm64.zip`.
+
+## Troubleshooting (test each part alone)
+
+```bash
+python mcq_blink.py led 3      # LED test: should blink 3 times
+python mcq_blink.py now        # screenshot + model + blink once, no hotkey
+MCQ_DEBUG=1 python mcq_blink.py  # prints every key press; hotkey prints "hotkey pressed"
+```
+
+- No key events printed -> grant Input Monitoring + Accessibility to your terminal, then restart it.
+- `now` fails -> check Screen Recording permission and that Ollama is running (`ollama list`).
+
+## Thinking mode
+
+Off by default (fast, ~2-6s). For hard maths/logic questions:
+
+```bash
+MCQ_THINK=1 python mcq_blink.py
+```
+
+Slower (can take 15-40s+) but more accurate. Other model: `MCQ_MODEL=qwen2.5vl:7b` (thinking is ignored by it).
+
+## Number of options
+
+Looks for A-F (6 options) by default. If your tests only have 4, set `"options": 4` in `~/.shadow/config.json`
+(or `MCQ_OPTIONS=4`). Fewer options = slightly more accurate. Range: 2-6.
+
+## Notes
+
+- First call is slow (model load, ~10-20s). Later ones ~3-8s. `keep_alive` holds it in RAM for 30 min.
+- Caps Lock is briefly toggled for real, so don't type during blinks. The original state is restored afterwards.
+- Caps Lock LED works on the built-in MacBook keyboard. External keyboards may not respond.
+- A 7B model gets maybe 60-80% on typical MCQs, less on hard maths. Treat answers as hints.
+- If answers are wrong due to small text, zoom the browser in or raise `MAX_WIDTH`.
+
+==> SHARING.md <==
+# Sharing Shadow with friends
+
+## You (builder) - once per version
+```bash
+cd ~/shadow
+./build_app.sh
+```
+This makes `Shadow-mac-arm64.zip`. Send that zip to friends (AirDrop, Drive, WhatsApp...).
+Test first without building: `./venv/bin/pip install -r requirements-app.txt && ./venv/bin/python shadow_app.py`
+
+## Friend (user) - one-time setup
+Needs: a Mac with Apple Silicon (M1 or newer), macOS 13+, 8 GB RAM or more (16 GB is smoother), ~5 GB free disk.
+
+1. Install **Ollama** from https://ollama.com/download and open it once.
+2. Unzip `Shadow-mac-arm64.zip`, drag **Shadow.app** into Applications.
+3. The app is not notarized by Apple, so the first time: **right-click -> Open -> Open**.
+   If macOS says it is "damaged", run: `xattr -cr /Applications/Shadow.app`
+4. A **Shadow** item appears in the menu bar. It will offer to download the AI model (~3.4 GB). Say Download.
+5. Menu bar -> **Permissions** -> enable **Astra** under Screen Recording, Accessibility and Input Monitoring. Quit and reopen the app after.
+6. Menu bar -> **Test LED** should blink the Caps Lock light 3 times.
+
+## Using it
+Show the question + options on screen, press **Ctrl + Option + Cmd + K**.
+LED on = thinking. Then blinks: 1 = A, 2 = B, 3 = C, 4 = D, 5 = E, 6 = F. 10 fast flickers = error.
+Questions with no options (one-word answers) show a popup in the top-right corner for 1 second, no LED.
+
+Change the hotkey/model: menu bar -> **Open config file** (`~/.shadow/config.json`), then quit and reopen.
+Example hotkey: `"hotkey": "cmd+shift+9"`. Number of answer choices: `"options": 4` (default 6, range 2-6). Also: `"popup_seconds": 1.0`, `"thinking_led": false`.
+
+## Notes
+- Works on the built-in MacBook keyboard LED. External keyboards may not light up.
+- Answers come from a small local AI model, so some will be wrong. Treat them as hints.
+- Rebuilding the app changes its signature, so macOS may ask for the permissions again.
+- Apple Developer signing + notarization ($99/yr) would remove the right-click -> Open step.
