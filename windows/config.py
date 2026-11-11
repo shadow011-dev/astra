@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 
-VERSION = "028"
+VERSION = "026"
 CONFIG_DIR = Path.home() / ".shadow"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LEGACY_FILES = [  # settings from before the renames
@@ -10,7 +10,7 @@ LEGACY_FILES = [  # settings from before the renames
     Path.home() / ".mcqblink" / "config.json",
 ]
 DEFAULTS = {
-    "hotkey": "ctrl+alt+cmd+k",  # Karna
+    "hotkey": "ctrl+alt+cmd+k",       # Karna (cmd = Windows key on Windows)
     "model": "qwen3.5:4b",
     "think": False,
     "two_step": True,       # read screen to text first, then answer with thinking (more accurate)
@@ -20,7 +20,7 @@ DEFAULTS = {
     "popup_seconds": 2.0,   # how long the one-word-answer popup stays on screen
     "ollama_url": "http://localhost:11434/api/chat",
     # ---- Arjuna: same pipeline, but the request goes to OpenRouter instead of local Ollama ----
-    "hotkey_arjuna": "ctrl+alt+cmd+m",  # Arjuna: press Alt+M
+    "hotkey_arjuna": "ctrl+alt+cmd+m",   # Arjuna
     "openrouter_api_key": "",          # key 1 (or set the OPENROUTER_API_KEY environment variable)
     "openrouter_api_key_2": "",        # optional: used after key 1 has made `key_switch_after` requests
     "openrouter_api_key_3": "",        # optional: used after key 2 has made `key_switch_after` requests
@@ -31,6 +31,7 @@ DEFAULTS = {
     "hotkey_arjuna_gemma": "ctrl+alt+cmd+m+k",
     "openrouter_model_gemma": "google/gemma-4-31b-it",
     "arjuna_two_step": False,          # False = one call (screenshot -> answer); True = read, then solve
+    "led_fix_v3": True,
 }
 
 
@@ -55,10 +56,17 @@ def load_config(path=None):
     cfg = dict(DEFAULTS)
     try:
         if path.exists():
-            cfg.update(_read(path))
-            # v028: restore documented, distinct Ctrl+Alt+Win hotkeys.
-            if cfg["hotkey"] == cfg["hotkey_arjuna"]:
+            raw = _read(path)
+            cfg.update(raw)
+            changed = False
+            if not raw.get("led_fix_v3"):
+                cfg["thinking_led"] = True
+                cfg["led_fix_v3"] = True
+                changed = True
+            if str(cfg["hotkey"]).strip().lower() == str(cfg["hotkey_arjuna"]).strip().lower():
                 cfg["hotkey"], cfg["hotkey_arjuna"] = DEFAULTS["hotkey"], DEFAULTS["hotkey_arjuna"]
+                changed = True
+            if changed:
                 save_config(cfg, path)
         else:
             if using_default:
@@ -66,6 +74,8 @@ def load_config(path=None):
                     if legacy.exists():
                         cfg.update(_read(legacy))
                         break
+            cfg["thinking_led"] = True
+            cfg["led_fix_v3"] = True
             save_config(cfg, path)
     except Exception:
         pass
@@ -76,6 +86,8 @@ def load_config(path=None):
     cfg["arjuna_two_step"] = bool(cfg["arjuna_two_step"])
     for k in ("openrouter_api_key", "openrouter_api_key_2", "openrouter_api_key_3"):
         cfg[k] = str(cfg[k] or "").strip()
+    for hk_key in ("hotkey", "hotkey_arjuna", "hotkey_arjuna_gemma"):
+        cfg[hk_key] = str(cfg.get(hk_key) or DEFAULTS[hk_key]).strip()
     try:
         cfg["key_switch_after"] = max(1, int(cfg["key_switch_after"]))
     except (TypeError, ValueError):

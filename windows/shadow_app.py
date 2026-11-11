@@ -114,9 +114,17 @@ class AstraApp:
         threading.Thread(target=self.check_setup, kwargs={"silent_ok": True}, daemon=True).start()
 
         last_state = None
+        last_cfg_mtime = None
         while self.icon.visible:
             p = self.pull
-            cur_state = (core.STATUS["state"], core.STATUS.get("runs"), p["active"], p["pct"])
+            try:
+                cfg_mtime = CONFIG_FILE.stat().st_mtime if CONFIG_FILE.exists() else 0
+                if cfg_mtime != last_cfg_mtime:
+                    last_cfg_mtime = cfg_mtime
+                    core.reload_runtime_config()
+            except Exception:
+                pass
+            cur_state = (core.STATUS["state"], core.STATUS.get("runs"), p["active"], p["pct"], core.HOTKEY, core.HOTKEY_ARJUNA, core.HOTKEY_GEMMA)
             if cur_state != last_state:
                 last_state = cur_state
                 if p["active"]:
