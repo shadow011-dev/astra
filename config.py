@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 
-VERSION = "025"
+VERSION = "026"
 CONFIG_DIR = Path.home() / ".shadow"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LEGACY_FILES = [  # settings from before the renames
@@ -56,8 +56,9 @@ def load_config(path=None):
     try:
         if path.exists():
             cfg.update(_read(path))
-            # v019: Karna moved M -> K and Arjuna N -> M. Move an untouched old pair over once.
-            if cfg["hotkey"] == "ctrl+alt+cmd+m" and cfg["hotkey_arjuna"] == "ctrl+alt+cmd+n":
+            # v026: old configs (Karna on M) clash with Arjuna's new default M. Reset the pair to K / M.
+            if cfg["hotkey"] == cfg["hotkey_arjuna"] or (
+                    cfg["hotkey"] == "ctrl+alt+cmd+m" and cfg["hotkey_arjuna"] in ("ctrl+alt+cmd+n", "ctrl+alt+cmd+m")):
                 cfg["hotkey"], cfg["hotkey_arjuna"] = DEFAULTS["hotkey"], DEFAULTS["hotkey_arjuna"]
                 save_config(cfg, path)
         else:
