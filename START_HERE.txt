@@ -1,0 +1,13 @@
+Shadow - source package (macOS, Apple Silicon)
+
+1. Install Ollama: https://ollama.com/download  (open it once)
+2. ollama pull qwen3.5:4b
+3. Open Terminal in this folder, then EITHER:
+     ./run_app.sh        -> run the menu-bar app straight from source
+     ./build_app.sh      -> build Shadow.app + Shadow-mac-arm64.zip to share with friends
+4. System Settings -> Privacy & Security: allow Screen Recording, Accessibility and
+   Input Monitoring for the app you launched it from (Terminal, or Shadow.app).
+
+Karna hotkey: Ctrl+Option+Cmd+K (local Ollama).  Arjuna hotkey: Ctrl+Option+Cmd+M (OpenRouter; menu -> Settings).  Arjuna + Gemma 4 31B: hold Ctrl+Option+Cmd and press M and K together (OpenRouter, image analysis).  LED blinks: 1=A 2=B 3=C 4=D 5=E 6=F, 10 fast flickers = error.
+One-word-answer questions: popup top-right for 1s, no LED.
+More details: SHARING.md and README.md

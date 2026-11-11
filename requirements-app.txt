@@ -1,0 +1,2 @@
+rumps
+pyinstaller>=6.15

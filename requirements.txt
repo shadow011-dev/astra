@@ -1,0 +1,6 @@
+requests
+pillow
+pynput
+pyobjc-framework-Cocoa
+rumps
+certifi
